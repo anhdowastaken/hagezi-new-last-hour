@@ -1,0 +1,7 @@
+repository: hagezi/dns-blocklists
+
+monitored_files:
+  - domains/tif.txt
+  # Add more files to monitor here
+  # - domains/pro.txt
+  # - domains/ultimate.txt

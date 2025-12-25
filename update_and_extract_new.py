@@ -1,166 +1,234 @@
 #!/usr/bin/env python3
 """
-Monitor Hagezi's TIF blocklist for new domains using git.
-Clones/pulls the repository and extracts newly added domains.
+Monitor Hagezi's blocklists for new records using GitHub API.
+Supports multiple files configured in config.yml.
 """
 
 import os
-from datetime import datetime
+import requests
+import yaml
+from datetime import datetime, UTC
 from git import Repo
+from pathlib import Path
 
-# Configuration
-REPO_URL = "https://github.com/hagezi/dns-blocklists.git"
-REPO_DIR = "hagezi-dns-blocklists"
-BLOCKLIST_PATH = "domains/tif.txt"
-OUTPUT_DIR = "domains"
-NEW_DOMAINS_FILE = "domains/new_last_hour.txt"
+# Configuration files
+CONFIG_FILE = "config.yml"
 LAST_COMMIT_FILE = "last_commit.txt"
 
+# GitHub API URLs
+API_BASE = "https://api.github.com"
+RAW_BASE = "https://raw.githubusercontent.com"
+
+def load_config():
+    """Load configuration from YAML file."""
+    with open(CONFIG_FILE, 'r') as f:
+        return yaml.safe_load(f)
+
 def load_last_commit():
-    """Load the last processed commit hash from file."""
+    """Load the last processed commit SHA from file."""
     if os.path.exists(LAST_COMMIT_FILE):
         with open(LAST_COMMIT_FILE, 'r') as f:
-            commit_hash = f.read().strip()
-            print(f"Last processed commit: {commit_hash}")
-            return commit_hash
+            commit_sha = f.read().strip()
+            print(f"Last processed commit: {commit_sha}")
+            return commit_sha
     return None
 
-def save_last_commit(commit_hash):
-    """Save the current commit hash to file."""
+def save_last_commit(commit_sha):
+    """Save the current commit SHA to file."""
     with open(LAST_COMMIT_FILE, 'w') as f:
-        f.write(commit_hash)
-    print(f"Saved current commit: {commit_hash}")
+        f.write(commit_sha)
+    print(f"Saved current commit: {commit_sha}")
 
-def setup_repository():
-    """Clone or update the Hagezi repository."""
-    if os.path.exists(REPO_DIR):
-        print(f"Repository exists, pulling latest changes...")
-        repo = Repo(REPO_DIR)
-        origin = repo.remotes.origin
-        origin.pull()
-        print("Repository updated")
-    else:
-        print(f"Cloning repository from {REPO_URL}...")
-        repo = Repo.clone_from(REPO_URL, REPO_DIR)
-        print("Repository cloned successfully")
+def github_api_request(endpoint):
+    """Make a request to GitHub API."""
+    url = f"{API_BASE}{endpoint}"
+    headers = {}
 
-    return repo
+    # Use GitHub token if available for higher rate limits
+    github_token = os.getenv('GITHUB_TOKEN')
+    if github_token:
+        headers['Authorization'] = f'token {github_token}'
 
-def extract_new_domains(repo, old_commit_hash, new_commit_hash, file_path):
-    """Extract new domains added between two commits."""
-    if not old_commit_hash:
-        print("No previous commit to compare, this is the first run")
-        return []
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
-    if old_commit_hash == new_commit_hash:
-        print("No changes detected")
-        return []
+def get_latest_commit(repo):
+    """Get the latest commit SHA for the repository."""
+    endpoint = f"/repos/{repo}/commits"
+    params = "?page=1&per_page=1"
 
-    print(f"Extracting changes between {old_commit_hash[:7]} and {new_commit_hash[:7]}...")
+    commits = github_api_request(endpoint + params)
+    if commits:
+        latest_commit = commits[0]
+        return latest_commit['sha'], latest_commit['commit']['committer']['date']
+    return None, None
 
-    # Get commit objects
-    old_commit = repo.commit(old_commit_hash)
-    new_commit = repo.commit(new_commit_hash)
+def get_file_content(repo, commit_sha, file_path):
+    """Fetch the file content at a specific commit."""
+    url = f"{RAW_BASE}/{repo}/{commit_sha}/{file_path}"
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response.text
 
-    # Get the diff between old and new commit for the specific file
-    diff = old_commit.diff(new_commit, paths=file_path, create_patch=True)
+def parse_records(content):
+    """Parse records from file content, filtering comments and empty lines."""
+    records = set()
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            records.add(line)
+    return records
 
-    new_domains = []
-    for diff_item in diff:
-        if diff_item.diff:
-            diff_text = diff_item.diff.decode('utf-8')
-            for line in diff_text.splitlines():
-                # Lines starting with '+' are additions (but skip +++ header)
-                if line.startswith('+') and not line.startswith('+++'):
-                    domain = line[1:].strip()
-                    # Skip empty lines and comments
-                    if domain and not domain.startswith('#'):
-                        new_domains.append(domain)
+def get_output_filename(file_path):
+    """Generate output filename: [monitored_file]_NEW_last_hour.[extension]"""
+    path_obj = Path(file_path)
+    directory = path_obj.parent  # e.g., "domains", "ips"
+    base_name = path_obj.stem  # filename without extension
+    extension = path_obj.suffix  # .txt, etc.
+    return os.path.join(str(directory), f"{base_name}_NEW_last_hour{extension}")
 
-    return new_domains
-
-def save_new_domains(domains):
-    """Save newly added domains to output file."""
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+def save_new_records(file_path, records):
+    """Save newly added records to output file."""
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    output_file = get_output_filename(file_path)
 
     # Create output directory if it doesn't exist
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
-    with open(NEW_DOMAINS_FILE, 'w') as f:
-        f.write(f"# New domains added to Hagezi TIF blocklist\n")
+    with open(output_file, 'w') as f:
+        f.write(f"# New records added to {file_path}\n")
         f.write(f"# Last updated: {timestamp}\n")
-        f.write(f"# Total new domains: {len(domains)}\n\n")
+        f.write(f"# Total new records: {len(records)}\n\n")
 
-        if domains:
-            for domain in sorted(domains):
-                f.write(f"{domain}\n")
+        if records:
+            for record in sorted(records):
+                f.write(f"{record}\n")
         else:
-            f.write("# No new domains detected in the last check\n")
+            f.write("# No new records detected in the last check\n")
 
-    print(f"Saved {len(domains)} new domains to {NEW_DOMAINS_FILE}")
+    print(f"  Saved {len(records)} new records to {output_file}")
+    return output_file
 
-def commit_changes():
+def process_file(repo, file_path, old_commit_sha, new_commit_sha):
+    """Process a single monitored file."""
+    print(f"\nProcessing {file_path}:")
+    print("-" * 60)
+
+    # Fetch file content for new commit
+    print("  Fetching latest file content...")
+    new_content = get_file_content(repo, new_commit_sha, file_path)
+    new_records_set = parse_records(new_content)
+    print(f"  Latest version has {len(new_records_set)} records")
+
+    if old_commit_sha:
+        print("  Fetching previous file content...")
+        try:
+            old_content = get_file_content(repo, old_commit_sha, file_path)
+            old_records_set = parse_records(old_content)
+            print(f"  Previous version had {len(old_records_set)} records")
+
+            # Find new records
+            new_records = new_records_set - old_records_set
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                print("  File did not exist in previous commit")
+                new_records = new_records_set
+            else:
+                raise
+    else:
+        print("  First run, no previous commit to compare")
+        new_records = set()
+
+    # Save results
+    output_file = save_new_records(file_path, new_records)
+
+    return output_file
+
+def commit_changes(output_files):
     """Commit changes to this repository."""
     try:
         repo = Repo('.')
 
-        # Files to commit
-        files_to_commit = [NEW_DOMAINS_FILE, LAST_COMMIT_FILE]
+        # Files to commit: all output files and last commit file
+        files_to_commit = output_files + [LAST_COMMIT_FILE]
 
         # Check if there are changes
         has_changes = False
         for file in files_to_commit:
-            if repo.is_dirty(path=file) or file in repo.untracked_files:
+            if os.path.exists(file) and (repo.is_dirty(path=file) or file in repo.untracked_files):
                 has_changes = True
                 break
 
         if has_changes:
-            timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
             repo.index.add(files_to_commit)
-            repo.index.commit(f'Update new domains - {timestamp}')
-            print(f"Committed changes")
+            repo.index.commit(f'Update new records - {timestamp}')
+            print(f"\nCommitted changes")
         else:
-            print("No changes to commit")
+            print("\nNo changes to commit")
     except Exception as e:
-        print(f"Error committing changes: {e}")
+        print(f"\nError committing changes: {e}")
 
 def main():
     """Main execution function."""
     try:
         print("=" * 60)
-        print("Hagezi TIF Blocklist - New Domains Tracker")
+        print("Hagezi Blocklists - New Records Tracker")
         print("=" * 60)
+
+        # Load configuration
+        config = load_config()
+        repo = config['repository']
+        monitored_files = config['monitored_files']
+
+        print(f"\nRepository: {repo}")
+        print(f"Monitoring {len(monitored_files)} file(s)")
+
+        # Get the latest commit from GitHub
+        latest_commit_sha, commit_date = get_latest_commit(repo)
+        if not latest_commit_sha:
+            print("Error: Could not fetch latest commit")
+            return
+
+        print(f"\nLatest commit: {latest_commit_sha[:7]}")
+        print(f"Commit date: {commit_date}")
 
         # Load last processed commit
-        old_commit_hash = load_last_commit()
+        old_commit_sha = load_last_commit()
 
-        # Setup and update the Hagezi repository
-        repo = setup_repository()
+        # Check if there are new changes
+        if old_commit_sha == latest_commit_sha:
+            print("No new changes detected in repository")
+            # Still update output files with empty results
+            output_files = []
+            for file_path in monitored_files:
+                output_file = save_new_records(file_path, [])
+                output_files.append(output_file)
+            commit_changes(output_files)
+            return
 
-        # Get current commit
-        current_commit = repo.head.commit
-        new_commit_hash = current_commit.hexsha
-        print(f"Current commit: {new_commit_hash}")
+        # Process each monitored file
+        output_files = []
+        for file_path in monitored_files:
+            output_file = process_file(repo, file_path, old_commit_sha, latest_commit_sha)
+            if output_file:
+                output_files.append(output_file)
 
-        # Extract new domains if there are changes
-        new_domains = extract_new_domains(repo, old_commit_hash, new_commit_hash, BLOCKLIST_PATH)
+        # Save the current commit SHA
+        save_last_commit(latest_commit_sha)
 
-        # Save results
-        save_new_domains(new_domains)
+        # Commit all changes
+        commit_changes(output_files)
 
-        # Save the current commit hash
-        save_last_commit(new_commit_hash)
-
-        # Commit to this repository
-        commit_changes()
-
-        print("=" * 60)
+        print("\n" + "=" * 60)
         print("Process completed successfully!")
-        print(f"Total new domains found: {len(new_domains)}")
         print("=" * 60)
 
     except Exception as e:
-        print(f"Error during execution: {e}")
+        print(f"\nError during execution: {e}")
         raise
 
 if __name__ == "__main__":
